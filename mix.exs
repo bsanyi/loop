@@ -4,12 +4,13 @@ defmodule Loop.MixProject do
   def project do
     [
       app: :loop,
-      version: "0.1.0",
+      version: "0.1.1",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       description: "Imperative style loops - functional performance",
       package: package(),
       deps: deps(),
+      docs: docs(),
       test_coverage: [
         summary: [threshold: 64],
         ignore_modules: []
@@ -31,6 +32,14 @@ defmodule Loop.MixProject do
       licenses: ["MIT"],
       maintainers: ["Sandor Bedo"],
       links: %{"GitHub" => "https://github.com/bsanyi/loop"}
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      extras: ["README.md"],
+      source_url: "https://github.com/bsanyi/loop"
     ]
   end
 

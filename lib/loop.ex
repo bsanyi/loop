@@ -438,12 +438,20 @@ defmodule Loop do
     |> elem(0)
   end
 
-  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp analyze(initials, body) do
     # Normalize AST to strip metadata so variable comparison works
     # regardless of source positions (e.g. in compiled test modules)
     body = normalize(body)
 
+    try_all_patterns(initials, body) ||
+      case desugar_tuple_assign(body) do
+        nil -> nil
+        alternatives -> Enum.find_value(alternatives, &try_all_patterns(initials, &1))
+      end
+  end
+
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  defp try_all_patterns(initials, body) do
     cond do
       match = map_pattern(initials, body) -> match
       match = filter_pattern(initials, body) -> match
@@ -484,6 +492,362 @@ defmodule Loop do
     end)
   end
 
+  # ============================================================================
+  # Tuple-Assignment Desugaring
+  # ============================================================================
+  # Converts `{v1, v2} = if/case ...` into block forms existing patterns handle.
+
+  defp desugar_tuple_assign({:=, _, [{v1, v2}, rhs]}) when is_tuple(v1) and is_tuple(v2) do
+    case extract_break_continue(rhs) do
+      nil -> nil
+      result -> desugar_extracted(v1, v2, result)
+    end
+  end
+
+  defp desugar_tuple_assign(_), do: nil
+
+  # Continue is a block — try direct extraction, then collapse assignments into a tuple
+  defp desugar_extracted(v1, v2, {list_var, break_expr, {:__block__, _, exprs}}) do
+    desugar_block_continue(v1, v2, list_var, break_expr, exprs) ||
+      with {_, _} = collapsed <- collapse_block(exprs) do
+        build_desugared_forms(v1, v2, list_var, break_expr, collapsed)
+      end
+  end
+
+  # Continue is a simple tuple
+  defp desugar_extracted(v1, v2, {list_var, break_expr, continue_tuple}) do
+    build_desugared_forms(v1, v2, list_var, break_expr, continue_tuple)
+  end
+
+  # Case with block continue and [h | rest] bindings
+  defp desugar_extracted(
+         v1,
+         v2,
+         {list_var, break_expr, {:__block__, _, exprs}, elem_var, rest_var}
+       ) do
+    desugar_block_continue_case(v1, v2, list_var, break_expr, exprs, elem_var, rest_var) ||
+      with {_, _} = collapsed <- collapse_block(exprs) do
+        build_desugared_forms_case(v1, v2, list_var, break_expr, collapsed, elem_var, rest_var)
+      end
+  end
+
+  # Case with simple tuple continue and [h | rest] bindings
+  defp desugar_extracted(v1, v2, {list_var, break_expr, continue_tuple, elem_var, rest_var}) do
+    build_desugared_forms_case(v1, v2, list_var, break_expr, continue_tuple, elem_var, rest_var)
+  end
+
+  # When the continue branch is a block ending with {v1, v2} matching the LHS,
+  # the inner assignments ARE the desugared body — just prepend the exit check.
+  # e.g. `product = product * hd(list); list = tl(list); {list, product}`
+  #   => `if list == [], do: break(product); product = product * hd(list); list = tl(list)`
+  defp desugar_block_continue(v1, v2, list_var, break_expr, exprs) do
+    {body_exprs, [last]} = Enum.split(exprs, -1)
+
+    if last == {v1, v2} and body_exprs != [] do
+      exit_check =
+        {:if, [], [{:==, [], [list_var, []]}, [do: {:break, [], [break_expr]}]]}
+
+      [{:__block__, [], [exit_check | body_exprs]}]
+    else
+      nil
+    end
+  end
+
+  # Same as above but for case with [h | rest] bindings
+  defp desugar_block_continue_case(v1, v2, list_var, break_expr, exprs, _elem_var, _rest_var) do
+    desugar_block_continue(v1, v2, list_var, break_expr, exprs)
+  end
+
+  # Collapse a block by inlining local variable assignments into the final expression.
+  # e.g. [prod = x * y, {tl(list), prod}] => {tl(list), x * y}
+  defp collapse_block(exprs) when length(exprs) >= 2 do
+    {preceding, [last]} = Enum.split(exprs, -1)
+
+    # Only collapse when ALL preceding expressions are simple variable assignments
+    subs =
+      Enum.reduce_while(preceding, [], fn
+        {:=, _, [{name, _, ctx}, expr]}, acc when is_atom(name) and is_atom(ctx) ->
+          {:cont, [{name, ctx, expr} | acc]}
+
+        _, _acc ->
+          {:halt, :error}
+      end)
+
+    case subs do
+      :error ->
+        nil
+
+      sub_list ->
+        # sub_list is reversed (last assignment first) — correct substitution order
+        Enum.reduce(sub_list, last, fn {name, ctx, expr}, ast ->
+          replace_var(ast, {name, [], ctx}, expr)
+        end)
+    end
+  end
+
+  defp collapse_block(_), do: nil
+
+  # Extract break/continue from if/case RHS
+  defp extract_break_continue({:if, _, [condition, [do: do_branch, else: else_branch]]}) do
+    cond do
+      # if list == [], do: break(x), else: {a, b}
+      match = empty_list_check?(condition) ->
+        {list_var, _} = match
+
+        case do_branch do
+          {:break, _, [break_expr]} -> {list_var, break_expr, else_branch}
+          _ -> nil
+        end
+
+      # if list != [], do: {a, b}, else: break(x)
+      match = non_empty_list_check?(condition) ->
+        {list_var, _} = match
+
+        case else_branch do
+          {:break, _, [break_expr]} -> {list_var, break_expr, do_branch}
+          _ -> nil
+        end
+
+      true ->
+        nil
+    end
+  end
+
+  defp extract_break_continue({:case, _, [scrutinee, [do: clauses]]}) do
+    extract_break_continue_case(scrutinee, clauses)
+  end
+
+  defp extract_break_continue(_), do: nil
+
+  defp extract_break_continue_case(scrutinee, clauses) when is_list(clauses) do
+    # Find the break clause (matches []) and the continue clause
+    {break_clause, continue_clause} = find_break_continue_clauses(clauses)
+
+    case {break_clause, continue_clause} do
+      {nil, _} ->
+        nil
+
+      {_, nil} ->
+        nil
+
+      {{_, break_expr}, {:wildcard, continue_expr}} ->
+        # case list do [] -> break(x); _ -> {a, b} end
+        {scrutinee, break_expr, continue_expr}
+
+      {{_, break_expr}, {:cons, elem_var, rest_var, continue_expr}} ->
+        # case list do [] -> break(x); [h | rest] -> {a, b} end
+        {scrutinee, break_expr, continue_expr, elem_var, rest_var}
+    end
+  end
+
+  defp find_break_continue_clauses(clauses) do
+    break_clause =
+      Enum.find_value(clauses, fn
+        {:->, _, [[[]], {:break, _, [break_expr]}]} -> {:empty, break_expr}
+        _ -> nil
+      end)
+
+    continue_clause =
+      Enum.find_value(clauses, fn
+        # [h | rest] -> continue_expr
+        {:->, _, [[[{:|, _, [elem_var, rest_var]}]], continue_expr]} ->
+          {:cons, elem_var, rest_var, continue_expr}
+
+        # _ -> continue_expr (but not the [] -> break clause)
+        {:->, _, [[{:_, _, _}], continue_expr]} ->
+          {:wildcard, continue_expr}
+
+        # var -> continue_expr (catch-all variable binding, not [])
+        {:->, _, [[{name, _, ctx}], continue_expr]}
+        when is_atom(name) and is_atom(ctx) ->
+          {:wildcard, continue_expr}
+
+        _ ->
+          nil
+      end)
+
+    {break_clause, continue_clause}
+  end
+
+  # Build desugared forms for if-based tuple assign (no case bindings)
+  defp build_desugared_forms(v1, v2, list_var, break_expr, {cont1, cont2}) do
+    # Determine which variable is the list variable
+    # by checking which continue element is tl(list_var)
+    {list_pos, acc_var, acc_update} =
+      cond do
+        tl_of?(cont1, list_var) -> {:first, v2, cont2}
+        tl_of?(cont2, list_var) -> {:second, v1, cont1}
+        true -> {nil, nil, nil}
+      end
+
+    case list_pos do
+      nil ->
+        nil
+
+      _ ->
+        exit_check =
+          {:if, [], [{:==, [], [list_var, []]}, [do: {:break, [], [break_expr]}]]}
+
+        h_var = {:h, [], nil}
+
+        # Form 1: destructure style — replace hd(list) with h
+        destructure_form =
+          {:__block__, [],
+           [
+             exit_check,
+             {:=, [], [[{:|, [], [h_var, list_var]}], list_var]},
+             {:=, [], [acc_var, replace_hd(acc_update, list_var, h_var)]}
+           ]}
+
+        # Form 2: hd/tl style — preserve hd(list)/tl(list)
+        reduce_form =
+          {:__block__, [],
+           [
+             exit_check,
+             {:=, [], [acc_var, acc_update]},
+             {:=, [], [list_var, {:tl, [], [list_var]}]}
+           ]}
+
+        [destructure_form, reduce_form]
+    end
+  end
+
+  defp build_desugared_forms(_, _, _, _, _), do: nil
+
+  # Build desugared forms for case with [h | rest] bindings
+  defp build_desugared_forms_case(
+         v1,
+         v2,
+         list_var,
+         break_expr,
+         continue_tuple,
+         elem_var,
+         rest_var
+       ) do
+    {cont1, cont2} =
+      case continue_tuple do
+        {c1, c2} -> {c1, c2}
+        _ -> {nil, nil}
+      end
+
+    # Find which position holds the rest variable (maps to list_var)
+    {list_pos, acc_var, acc_update} =
+      cond do
+        cont1 == rest_var -> {:first, v2, cont2}
+        cont2 == rest_var -> {:second, v1, cont1}
+        true -> {nil, nil, nil}
+      end
+
+    case list_pos do
+      nil ->
+        nil
+
+      _ ->
+        exit_check =
+          {:if, [], [{:==, [], [list_var, []]}, [do: {:break, [], [break_expr]}]]}
+
+        # Only destructure form makes sense for case with [h | rest]
+        # Replace rest_var with list_var in acc_update
+        acc_update = replace_var(acc_update, rest_var, list_var)
+
+        destructure_form =
+          {:__block__, [],
+           [
+             exit_check,
+             {:=, [], [[{:|, [], [elem_var, list_var]}], list_var]},
+             {:=, [], [acc_var, acc_update]}
+           ]}
+
+        [destructure_form]
+    end
+  end
+
+  # Check if expr is tl(var)
+  defp tl_of?({:tl, _, [arg]}, var), do: arg == var
+  defp tl_of?(_, _), do: false
+
+  # Replace hd(list_var) with replacement in AST
+  defp replace_hd(ast, list_var, replacement) do
+    Macro.prewalk(ast, fn
+      {:hd, _, [arg]} = node ->
+        if arg == list_var, do: replacement, else: node
+
+      node ->
+        node
+    end)
+  end
+
+  # Comprehensive helper to recognize various forms of "is list non-empty?" checks
+  # Returns {list_var, list_var} if recognized, nil otherwise
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  defp non_empty_list_check?(condition) do
+    case condition do
+      # list != [] or [] != list
+      {:!=, _, [list, []]} ->
+        {list, list}
+
+      {:!=, _, [[], list]} ->
+        {list, list}
+
+      # list !== [] or [] !== list
+      {:!==, _, [list, []]} ->
+        {list, list}
+
+      {:!==, _, [[], list]} ->
+        {list, list}
+
+      # Kernel.!=(list, []) or Kernel.!=([], list)
+      {{:., _, [{:__aliases__, _, [:Kernel]}, :!=]}, _, [list, []]} ->
+        {list, list}
+
+      {{:., _, [{:__aliases__, _, [:Kernel]}, :!=]}, _, [[], list]} ->
+        {list, list}
+
+      # Kernel.!==(list, []) or Kernel.!==([], list)
+      {{:., _, [{:__aliases__, _, [:Kernel]}, :!==]}, _, [list, []]} ->
+        {list, list}
+
+      {{:., _, [{:__aliases__, _, [:Kernel]}, :!==]}, _, [[], list]} ->
+        {list, list}
+
+      # !Enum.empty?(list)
+      {:!, _, [{{:., _, [{:__aliases__, _, [:Enum]}, :empty?]}, _, [list]}]} ->
+        {list, list}
+
+      # not Enum.empty?(list)
+      {:not, _, [{{:., _, [{:__aliases__, _, [:Enum]}, :empty?]}, _, [list]}]} ->
+        {list, list}
+
+      # match?([_ | _], list)
+      {:match?, _, [[{:|, _, [{:_, _, _}, {:_, _, _}]}], list]} ->
+        {list, list}
+
+      # length(list) > 0
+      {:>, _, [{:length, _, [list]}, 0]} ->
+        {list, list}
+
+      {:<, _, [0, {:length, _, [list]}]} ->
+        {list, list}
+
+      # length(list) >= 1
+      {:>=, _, [{:length, _, [list]}, 1]} ->
+        {list, list}
+
+      {:<=, _, [1, {:length, _, [list]}]} ->
+        {list, list}
+
+      # length(list) != 0
+      {:!=, _, [{:length, _, [list]}, 0]} ->
+        {list, list}
+
+      {:!=, _, [0, {:length, _, [list]}]} ->
+        {list, list}
+
+      _ ->
+        nil
+    end
+  end
+
   # Map Pattern: loop acc: [] with [expr | acc] accumulation
   defp map_pattern([acc: []], body) do
     with {:__block__, _, [exit, destructure, accumulate]} <- body,
@@ -500,14 +864,13 @@ defmodule Loop do
 
   defp map_pattern(_, _), do: nil
 
-  defp map_exit_strategy(
-         {:if, _,
-          [
-            {{:., _, [{:__aliases__, _, [:Enum]}, :empty?]}, _, [list]},
-            [do: {:break, _, [{{:., _, [{:__aliases__, _, [:Enum]}, :reverse]}, _, [acc]}]}]
-          ]}
-       ) do
-    {list, acc}
+  defp map_exit_strategy({:if, _, [condition, [do: {:break, _, [reverse_expr]}]]}) do
+    with {{:., _, [{:__aliases__, _, [:Enum]}, :reverse]}, _, [acc]} <- reverse_expr,
+         {list, ^acc} <- empty_list_check?(condition) do
+      {list, acc}
+    else
+      _ -> nil
+    end
   end
 
   defp map_exit_strategy(_), do: nil
@@ -575,8 +938,11 @@ defmodule Loop do
 
   defp find_pattern(_, _), do: nil
 
-  defp find_exit_empty({:if, _, [{:==, _, [list, []]}, [do: {:break, _, [nil]}]]}) do
-    list
+  defp find_exit_empty({:if, _, [condition, [do: {:break, _, [nil]}]]}) do
+    case empty_list_check?(condition) do
+      {list, _} -> list
+      nil -> nil
+    end
   end
 
   defp find_exit_empty(_), do: nil
@@ -604,8 +970,11 @@ defmodule Loop do
 
   defp count_pattern(_, _), do: nil
 
-  defp count_exit_strategy({:if, _, [{:==, _, [list, []]}, [do: {:break, _, [count]}]]}) do
-    {list, count}
+  defp count_exit_strategy({:if, _, [condition, [do: {:break, _, [count]}]]}) do
+    case empty_list_check?(condition) do
+      {list, _} -> {list, count}
+      nil -> nil
+    end
   end
 
   defp count_exit_strategy(_), do: nil
@@ -641,8 +1010,11 @@ defmodule Loop do
 
   defp any_pattern(_, _), do: nil
 
-  defp any_exit_strategy({:if, _, [{:==, _, [list, []]}, [do: {:break, _, [result]}]]}) do
-    {list, result}
+  defp any_exit_strategy({:if, _, [condition, [do: {:break, _, [result]}]]}) do
+    case empty_list_check?(condition) do
+      {list, _} -> {list, result}
+      nil -> nil
+    end
   end
 
   defp any_exit_strategy(_), do: nil
@@ -678,8 +1050,11 @@ defmodule Loop do
 
   defp all_pattern(_, _), do: nil
 
-  defp all_exit_strategy({:if, _, [{:==, _, [list, []]}, [do: {:break, _, [result]}]]}) do
-    {list, result}
+  defp all_exit_strategy({:if, _, [condition, [do: {:break, _, [result]}]]}) do
+    case empty_list_check?(condition) do
+      {list, _} -> {list, result}
+      nil -> nil
+    end
   end
 
   defp all_exit_strategy(_), do: nil
@@ -745,18 +1120,11 @@ defmodule Loop do
   defp reverse_pattern(_, _), do: nil
 
   # break(acc) without Enum.reverse
-  defp reverse_exit_strategy({:if, _, [{:==, _, [list, []]}, [do: {:break, _, [acc]}]]}) do
-    {list, acc}
-  end
-
-  defp reverse_exit_strategy(
-         {:if, _,
-          [
-            {{:., _, [{:__aliases__, _, [:Enum]}, :empty?]}, _, [list]},
-            [do: {:break, _, [acc]}]
-          ]}
-       ) do
-    {list, acc}
+  defp reverse_exit_strategy({:if, _, [condition, [do: {:break, _, [acc]}]]}) do
+    case empty_list_check?(condition) do
+      {list, _} -> {list, acc}
+      nil -> nil
+    end
   end
 
   defp reverse_exit_strategy(_), do: nil
@@ -820,18 +1188,11 @@ defmodule Loop do
 
   defp member_pattern(_, _), do: nil
 
-  defp member_exit_empty({:if, _, [{:==, _, [list, []]}, [do: {:break, _, [false]}]]}) do
-    list
-  end
-
-  defp member_exit_empty(
-         {:if, _,
-          [
-            {{:., _, [{:__aliases__, _, [:Enum]}, :empty?]}, _, [list]},
-            [do: {:break, _, [false]}]
-          ]}
-       ) do
-    list
+  defp member_exit_empty({:if, _, [condition, [do: {:break, _, [false]}]]}) do
+    case empty_list_check?(condition) do
+      {list, _} -> list
+      nil -> nil
+    end
   end
 
   defp member_exit_empty(_), do: nil
@@ -960,32 +1321,12 @@ defmodule Loop do
     end
   end
 
-  defp each_exit_empty({:if, _, [{:==, _, [list, []]}, [do: {:break, _, [nil]}]]}) do
-    list
-  end
-
-  defp each_exit_empty({:if, _, [{:==, _, [list, []]}, [do: {:break, _, []}]]}) do
-    list
-  end
-
-  defp each_exit_empty(
-         {:if, _,
-          [
-            {{:., _, [{:__aliases__, _, [:Enum]}, :empty?]}, _, [list]},
-            [do: {:break, _, [nil]}]
-          ]}
-       ) do
-    list
-  end
-
-  defp each_exit_empty(
-         {:if, _,
-          [
-            {{:., _, [{:__aliases__, _, [:Enum]}, :empty?]}, _, [list]},
-            [do: {:break, _, []}]
-          ]}
-       ) do
-    list
+  defp each_exit_empty({:if, _, [condition, [do: {:break, _, break_val}]]})
+       when break_val == [nil] or break_val == [] do
+    case empty_list_check?(condition) do
+      {list, _} -> list
+      nil -> nil
+    end
   end
 
   defp each_exit_empty(_), do: nil
@@ -1047,18 +1388,11 @@ defmodule Loop do
 
   defp drop_while_pattern(_, _), do: nil
 
-  defp drop_while_exit_empty({:if, _, [{:==, _, [list, []]}, [do: {:break, _, [[]]}]]}) do
-    list
-  end
-
-  defp drop_while_exit_empty(
-         {:if, _,
-          [
-            {{:., _, [{:__aliases__, _, [:Enum]}, :empty?]}, _, [list]},
-            [do: {:break, _, [[]]}]
-          ]}
-       ) do
-    list
+  defp drop_while_exit_empty({:if, _, [condition, [do: {:break, _, [[]]}]]}) do
+    case empty_list_check?(condition) do
+      {list, _} -> list
+      nil -> nil
+    end
   end
 
   defp drop_while_exit_empty(_), do: nil
@@ -1176,18 +1510,11 @@ defmodule Loop do
     end
   end
 
-  defp reduce_while_exit({:if, _, [{:==, _, [list, []]}, [do: {:break, _, [acc]}]]}) do
-    {list, acc}
-  end
-
-  defp reduce_while_exit(
-         {:if, _,
-          [
-            {{:., _, [{:__aliases__, _, [:Enum]}, :empty?]}, _, [list]},
-            [do: {:break, _, [acc]}]
-          ]}
-       ) do
-    {list, acc}
+  defp reduce_while_exit({:if, _, [condition, [do: {:break, _, [acc]}]]}) do
+    case empty_list_check?(condition) do
+      {list, _} -> {list, acc}
+      nil -> nil
+    end
   end
 
   defp reduce_while_exit(_), do: nil
@@ -1278,8 +1605,11 @@ defmodule Loop do
     end
   end
 
-  defp max_min_exit({:if, _, [{:==, _, [list, []]}, [do: {:break, _, [best]}]]}) do
-    {list, best}
+  defp max_min_exit({:if, _, [condition, [do: {:break, _, [best]}]]}) do
+    case empty_list_check?(condition) do
+      {list, _} -> {list, best}
+      nil -> nil
+    end
   end
 
   defp max_min_exit(_), do: nil
@@ -1319,18 +1649,11 @@ defmodule Loop do
     end
   end
 
-  defp frequencies_exit({:if, _, [{:==, _, [list, []]}, [do: {:break, _, [freq]}]]}) do
-    {list, freq}
-  end
-
-  defp frequencies_exit(
-         {:if, _,
-          [
-            {{:., _, [{:__aliases__, _, [:Enum]}, :empty?]}, _, [list]},
-            [do: {:break, _, [freq]}]
-          ]}
-       ) do
-    {list, freq}
+  defp frequencies_exit({:if, _, [condition, [do: {:break, _, [freq]}]]}) do
+    case empty_list_check?(condition) do
+      {list, _} -> {list, freq}
+      nil -> nil
+    end
   end
 
   defp frequencies_exit(_), do: nil
@@ -1374,18 +1697,11 @@ defmodule Loop do
     end
   end
 
-  defp map_new_exit({:if, _, [{:==, _, [list, []]}, [do: {:break, _, [acc]}]]}) do
-    {list, acc}
-  end
-
-  defp map_new_exit(
-         {:if, _,
-          [
-            {{:., _, [{:__aliases__, _, [:Enum]}, :empty?]}, _, [list]},
-            [do: {:break, _, [acc]}]
-          ]}
-       ) do
-    {list, acc}
+  defp map_new_exit({:if, _, [condition, [do: {:break, _, [acc]}]]}) do
+    case empty_list_check?(condition) do
+      {list, _} -> {list, acc}
+      nil -> nil
+    end
   end
 
   defp map_new_exit(_), do: nil
@@ -1493,6 +1809,132 @@ defmodule Loop do
 
   defp vars_equal?(_, _), do: false
 
+  # Comprehensive helper to recognize various forms of "is list empty?" checks
+  # Returns {list_var, list_var} if recognized, nil otherwise
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  defp empty_list_check?(condition) do
+    case condition do
+      # list == [] or [] == list
+      {:==, _, [list, []]} ->
+        {list, list}
+
+      {:==, _, [[], list]} ->
+        {list, list}
+
+      # list === [] or [] === list
+      {:===, _, [list, []]} ->
+        {list, list}
+
+      {:===, _, [[], list]} ->
+        {list, list}
+
+      # Kernel.==(list, []) or Kernel.==([], list)
+      {{:., _, [{:__aliases__, _, [:Kernel]}, :==]}, _, [list, []]} ->
+        {list, list}
+
+      {{:., _, [{:__aliases__, _, [:Kernel]}, :==]}, _, [[], list]} ->
+        {list, list}
+
+      # Kernel.===(list, []) or Kernel.===([], list)
+      {{:., _, [{:__aliases__, _, [:Kernel]}, :===]}, _, [list, []]} ->
+        {list, list}
+
+      {{:., _, [{:__aliases__, _, [:Kernel]}, :===]}, _, [[], list]} ->
+        {list, list}
+
+      # Enum.empty?(list)
+      {{:., _, [{:__aliases__, _, [:Enum]}, :empty?]}, _, [list]} ->
+        {list, list}
+
+      # not match?([_ | _], list)
+      {:not, _, [{{:match?, _, [[{:|, _, [{:_, _, _}, {:_, _, _}]}], list]}}]} ->
+        {list, list}
+
+      # not Kernel.match?([_ | _], list)
+      {:not, _,
+       [
+         {{:., _, [{:__aliases__, _, [:Kernel]}, :match?]}, _,
+          [[{:|, _, [{:_, _, _}, {:_, _, _}]}], list]}
+       ]} ->
+        {list, list}
+
+      # match?([], list)
+      {:match?, _, [[], list]} ->
+        {list, list}
+
+      # Kernel.match?([], list)
+      {{:., _, [{:__aliases__, _, [:Kernel]}, :match?]}, _, [[], list]} ->
+        {list, list}
+
+      # length(list) == 0 or 0 == length(list)
+      {:==, _, [{:length, _, [list]}, 0]} ->
+        {list, list}
+
+      {:==, _, [0, {:length, _, [list]}]} ->
+        {list, list}
+
+      # length(list) <= 0 or 0 >= length(list)
+      {:<=, _, [{:length, _, [list]}, 0]} ->
+        {list, list}
+
+      {:>=, _, [0, {:length, _, [list]}]} ->
+        {list, list}
+
+      # length(list) < 1 or 1 > length(list)
+      {:<, _, [{:length, _, [list]}, 1]} ->
+        {list, list}
+
+      {:>, _, [1, {:length, _, [list]}]} ->
+        {list, list}
+
+      # Enum.count(list) == 0 or 0 == Enum.count(list)
+      {:==, _, [{{:., _, [{:__aliases__, _, [:Enum]}, :count]}, _, [list]}, 0]} ->
+        {list, list}
+
+      {:==, _, [0, {{:., _, [{:__aliases__, _, [:Enum]}, :count]}, _, [list]}]} ->
+        {list, list}
+
+      # Enum.count(list) <= 0 or 0 >= Enum.count(list)
+      {:<=, _, [{{:., _, [{:__aliases__, _, [:Enum]}, :count]}, _, [list]}, 0]} ->
+        {list, list}
+
+      {:>=, _, [0, {{:., _, [{:__aliases__, _, [:Enum]}, :count]}, _, [list]}]} ->
+        {list, list}
+
+      # Enum.count(list) < 1 or 1 > Enum.count(list)
+      {:<, _, [{{:., _, [{:__aliases__, _, [:Enum]}, :count]}, _, [list]}, 1]} ->
+        {list, list}
+
+      {:>, _, [1, {{:., _, [{:__aliases__, _, [:Enum]}, :count]}, _, [list]}]} ->
+        {list, list}
+
+      # case list do [] -> true; _ -> false end
+      {:case, _, [list, [do: [{:->, _, [[[], true]], _}]]]} ->
+        {list, list}
+
+      # List.flatten(list) == [] or [] == List.flatten(list)
+      {:==, _, [{{:., _, [{:__aliases__, _, [:List]}, :flatten]}, _, [list]}, []]} ->
+        {list, list}
+
+      {:==, _, [[], {{:., _, [{:__aliases__, _, [:List]}, :flatten]}, _, [list]}]} ->
+        {list, list}
+
+      # :lists.flatten(list) == [] or [] == :lists.flatten(list)
+      {:==, _, [{{:., _, [:lists, :flatten]}, _, [list]}, []]} ->
+        {list, list}
+
+      {:==, _, [[], {{:., _, [:lists, :flatten]}, _, [list]}]} ->
+        {list, list}
+
+      # match?([], list) (might be wrapped differently)
+      {{:., _, [:erlang, :match?]}, _, [[], list]} ->
+        {list, list}
+
+      _ ->
+        nil
+    end
+  end
+
   # Reduce Pattern: existing implementation
   defp reduce_pattern(initials, body) do
     case reduce(initials, body) do
@@ -1540,8 +1982,11 @@ defmodule Loop do
 
   defp reduce(_initials, _body), do: nil
 
-  defp exit_strategy({:if, _, [{:==, _, [object, []]}, [do: {:break, _, [target]}]]}) do
-    {object, target}
+  defp exit_strategy({:if, _, [condition, [do: {:break, _, [target]}]]}) do
+    case empty_list_check?(condition) do
+      {object, _} -> {object, target}
+      nil -> nil
+    end
   end
 
   defp exit_strategy(_), do: nil
