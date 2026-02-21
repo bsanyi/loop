@@ -3,14 +3,23 @@
 An Elixir macro that provides imperative-style loop syntax with automatic
 compile-time optimization to functional patterns. Write loops like you would in
 imperative languages, and let the compiler intelligently transform them to
-efficient `Enum` operations.
+functional patterns.
+
+During [an interview with Prime](https://youtu.be/-mFJ5rPbY_w?t=2388), José
+Valim discussed a common challenge faced by new programmers: understanding
+complex functional patterns such as map-reduce. In addition to these patterns,
+others like simple reducers and recursion can be equally daunting for
+beginners. My proof-of-concept application addresses this issue by enabling
+inexperienced developers to write imperative-style loops that are familiar to
+them, while still allowing them to learn the underlying idiomatic functional
+constructs.
 
 ## Features
 
-- **Imperative Loop Syntax**: Write familiar `loop`/`break` constructs
-- **Automatic Optimization**: Recognizes common patterns and optimizes to `Enum` functions
-- **Mutable-like State**: Bindings carry over between iterations, simulating mutable state
-- **Pattern Recognition**: Supports 26 optimization patterns out of the box
+- **Imperative Loop Syntax** - Write familiar `loop`/`break` constructs
+- **Automatic Optimization** - Recognizes common patterns and optimizes to `Enum` functions
+- **Mutable-like State** - Bindings carry over between iterations, simulating mutable state
+- **Pattern Recognition** - Supports dozens of optimization patterns, including advanced collection transforms
 
 ## Quick Start
 
@@ -50,8 +59,7 @@ quote do
   end
 end
 |> Macro.expand(__ENV__)
-|> Macro.to_string()
-     #=> "Enum.product(list)"
+|> Macro.to_string()        #=> "Enum.product(list)"
 ```
 
 ## Core Concepts
@@ -93,8 +101,10 @@ end
 
 ## Automatic Pattern Optimization
 
-Loop recognizes 26 common patterns and automatically optimizes them to
+Loop recognizes many common patterns and automatically optimizes them to
 equivalent `Enum` operations at compile-time, with zero runtime overhead.
+
+The 26 classic examples are below, and there are additional advanced patterns too.
 
 ### 1. Map
 
@@ -272,6 +282,14 @@ loop acc: [], i: 0 do
   i = i + 1
 end
 # => Enum.with_index(list)
+
+loop acc: [], i: 5 do
+  if Enum.empty?(list), do: break(Enum.reverse(acc))
+  [h | list] = list
+  acc = [{h, i} | acc]
+  i = i + 1
+end
+# => Enum.with_index(list, 5)
 ```
 
 ### 17. Zip
@@ -389,6 +407,133 @@ end
 # (Other init/op combos become Enum.reduce)
 ```
 
+## Additional Advanced Patterns (Showcase)
+
+### Flat Map
+
+```elixir
+loop acc: [] do
+  if list == [], do: break(acc)
+  [h | list] = list
+  acc = acc ++ [h, -h]
+end
+# => Enum.flat_map(list, fn h -> [h, -h] end)
+```
+
+### Map Reduce
+
+```elixir
+loop mapped: [], state: 0 do
+  if list == [], do: break({Enum.reverse(mapped), state})
+  [h | list] = list
+  mapped = [h + state | mapped]
+  state = state + h
+end
+# => Enum.map_reduce(list, 0, fn h, state -> {h + state, state + h} end)
+```
+
+### Group By
+
+```elixir
+loop groups: %{} do
+  if list == [], do: break(groups)
+  [h | list] = list
+  key = rem(h, 2)
+  groups = Map.update(groups, key, [h], &(&1 ++ [h]))
+end
+# => Enum.group_by(list, &rem(&1, 2))
+```
+
+### Uniq By
+
+```elixir
+loop acc: [], seen: MapSet.new() do
+  if list == [], do: break(Enum.reverse(acc))
+  [h | list] = list
+  key = rem(h, 3)
+  acc = if MapSet.member?(seen, key), do: acc, else: [h | acc]
+  seen = MapSet.put(seen, key)
+end
+# => Enum.uniq_by(list, &rem(&1, 3))
+```
+
+### Chunk Every
+
+```elixir
+loop chunks: [] do
+  if list == [], do: break(Enum.reverse(chunks))
+  chunks = [Enum.take(list, size) | chunks]
+  list = Enum.drop(list, size)
+end
+# => Enum.chunk_every(list, size)
+
+loop chunks: [] do
+  if list == [], do: break(Enum.reverse(chunks))
+  chunks = [Enum.take(list, size) | chunks]
+  list = Enum.drop(list, step)
+end
+# => Enum.chunk_every(list, size, step)
+
+loop chunks: [] do
+  if list == [] or length(list) < size, do: break(Enum.reverse(chunks))
+  chunks = [Enum.take(list, size) | chunks]
+  list = Enum.drop(list, step)
+end
+# => Enum.chunk_every(list, size, step, :discard)
+```
+
+### Split While
+
+```elixir
+loop left: [] do
+  if list == [], do: break({Enum.reverse(left), []})
+  [h | list] = list
+  left = if h > 0, do: [h | left], else: break({Enum.reverse(left), [h | list]})
+end
+# => Enum.split_while(list, &(&1 > 0))
+```
+
+### Zip With / Unzip
+
+```elixir
+loop acc: [] do
+  if list1 == [] or list2 == [], do: break(Enum.reverse(acc))
+  [x | list1] = list1
+  [y | list2] = list2
+  acc = [x + y * 2 | acc]
+end
+# => Enum.zip_with(list1, list2, fn x, y -> x + y * 2 end)
+
+loop left: [], right: [] do
+  if list == [], do: break({Enum.reverse(left), Enum.reverse(right)})
+  [pair | list] = list
+  left = [elem(pair, 0) | left]
+  right = [elem(pair, 1) | right]
+end
+# => Enum.unzip(list)
+```
+
+### Max By / Min By / Frequencies By
+
+```elixir
+loop best: hd(list), best_key: String.length(hd(list)) do
+  list = tl(list)
+  if list == [], do: break(best)
+  candidate = hd(list)
+  candidate_key = String.length(candidate)
+  {best, best_key} = if candidate_key > best_key, do: {candidate, candidate_key}, else: {best, best_key}
+end
+# => Enum.max_by(list, &String.length/1)
+# (same shape with < => Enum.min_by/2)
+
+loop freq: %{} do
+  if list == [], do: break(freq)
+  [h | list] = list
+  freq = Map.update(freq, String.first(h), 1, &(&1 + 1))
+end
+# => Enum.frequencies_by(list, &String.first/1)
+```
+
 ## Practical Examples
 
 ### Counter Service
@@ -450,4 +595,3 @@ Loop is a thought experiment and proof of concept showing that:
 1. Elixir's meta-programming capabilities enable unconventional syntax
 2. Macros can recognize algorithmic patterns
 3. Imperative-looking code can be compiled to efficient functional operations
-

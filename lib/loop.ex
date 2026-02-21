@@ -278,6 +278,8 @@ defmodule Loop do
       loop do
         IO.write(Enum.random([IO.ANSI.red(), IO.ANSI.green(), IO.ANSI.blue()]))
         IO.write(Enum.random(items))
+        Process.sleep(100)
+        IO.write(IO.ANSI.cursor_left())
       end
 
   ## `break()` out of the loop
@@ -439,46 +441,72 @@ defmodule Loop do
   end
 
   defp analyze(initials, body) do
-    # Normalize AST to strip metadata so variable comparison works
-    # regardless of source positions (e.g. in compiled test modules)
-    body = normalize(body)
-
-    try_all_patterns(initials, body) ||
-      case desugar_tuple_assign(body) do
-        nil -> nil
-        alternatives -> Enum.find_value(alternatives, &try_all_patterns(initials, &1))
-      end
+    Loop.Analyzer.analyze(initials, body,
+      normalize: &normalize/1,
+      try_patterns: &try_all_patterns/2,
+      desugar_tuple_assign: &desugar_tuple_assign/1
+    )
   end
 
-  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp try_all_patterns(initials, body) do
-    cond do
-      match = map_pattern(initials, body) -> match
-      match = filter_pattern(initials, body) -> match
-      match = reject_pattern(initials, body) -> match
-      match = reverse_pattern(initials, body) -> match
-      match = filter_map_pattern(initials, body) -> match
-      match = find_pattern(initials, body) -> match
-      match = member_pattern(initials, body) -> match
-      match = find_index_pattern(initials, body) -> match
-      match = count_pattern(initials, body) -> match
-      match = length_pattern(initials, body) -> match
-      match = any_pattern(initials, body) -> match
-      match = all_pattern(initials, body) -> match
-      match = each_pattern(initials, body) -> match
-      match = take_while_pattern(initials, body) -> match
-      match = drop_while_pattern(initials, body) -> match
-      match = with_index_pattern(initials, body) -> match
-      match = zip_pattern(initials, body) -> match
-      match = reduce_while_pattern(initials, body) -> match
-      match = dedup_pattern(initials, body) -> match
-      match = max_min_pattern(initials, body) -> match
-      match = frequencies_pattern(initials, body) -> match
-      match = map_new_pattern(initials, body) -> match
-      match = scan_pattern(initials, body) -> match
-      match = reduce_pattern(initials, body) -> match
-      true -> nil
-    end
+    [
+      &map_pattern/2,
+      &filter_pattern/2,
+      &reject_pattern/2,
+      &reverse_pattern/2,
+      &filter_map_pattern/2,
+      &flat_map_pattern/2,
+      &map_reduce_pattern/2,
+      &flat_map_reduce_pattern/2,
+      &none_pattern/2,
+      &find_pattern/2,
+      &find_default_pattern/2,
+      &find_value_pattern/2,
+      &find_value_default_pattern/2,
+      &member_pattern/2,
+      &find_at_pattern/2,
+      &find_index_pattern/2,
+      &count_pattern/2,
+      &sum_by_pattern/2,
+      &length_pattern/2,
+      &any_pattern/2,
+      &all_pattern/2,
+      &each_pattern/2,
+      &take_while_pattern/2,
+      &drop_while_pattern/2,
+      &partition_pattern/2,
+      &chunk_every_pattern/2,
+      &chunk_by_pattern/2,
+      &take_pattern/2,
+      &map_intersperse_pattern/2,
+      &map_join_pattern/2,
+      &map_every_pattern/2,
+      &take_every_pattern/2,
+      &drop_pattern/2,
+      &split_while_pattern/2,
+      &split_pattern/2,
+      &with_index_pattern/2,
+      &zip_with_pattern/2,
+      &zip_reduce_pattern/2,
+      &zip_pattern/2,
+      &unzip_pattern/2,
+      &reduce_while_pattern/2,
+      &dedup_pattern/2,
+      &uniq_pattern/2,
+      &uniq_by_pattern/2,
+      &min_max_by_pattern/2,
+      &max_by_min_by_pattern/2,
+      &min_max_pattern/2,
+      &max_min_pattern/2,
+      &frequencies_pattern/2,
+      &frequencies_by_pattern/2,
+      &group_by_pattern/2,
+      &map_new_pattern/2,
+      &into_mapset_pattern/2,
+      &scan_pattern/2,
+      &reduce_pattern/2
+    ]
+    |> Enum.find_value(fn matcher -> matcher.(initials, body) end)
   end
 
   # Strip metadata from AST so that variable nodes at different source
@@ -848,6 +876,187 @@ defmodule Loop do
     end
   end
 
+  # Canonical IR for list-processing loops.
+  # Returns %{list_var, elem_var, break_expr, steps} or nil.
+  defp list_loop_ir(body) do
+    case body do
+      {:__block__, _, exprs} ->
+        list_loop_ir_from_block(exprs)
+
+      {:case, _, [scrutinee, [do: clauses]]} ->
+        list_loop_ir_from_case(scrutinee, clauses)
+
+      {:cond, _, [[do: clauses]]} ->
+        list_loop_ir_from_cond(clauses)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp list_loop_ir_from_block([exit_expr | tail]) do
+    with {list_var, break_expr} <- empty_break_clause(exit_expr),
+         {elem_var, steps} <- parse_continue_expr(list_var, tail) do
+      %{list_var: list_var, elem_var: elem_var, break_expr: break_expr, steps: steps}
+    else
+      _ -> nil
+    end
+  end
+
+  defp list_loop_ir_from_block(_), do: nil
+
+  defp list_loop_ir_from_case(scrutinee, clauses) when is_list(clauses) do
+    with {{:empty, break_expr}, continue_clause} <- find_break_continue_clauses(clauses),
+         {elem_var, steps} <- case_continue_to_steps(scrutinee, continue_clause) do
+      %{list_var: scrutinee, elem_var: elem_var, break_expr: break_expr, steps: steps}
+    else
+      _ -> nil
+    end
+  end
+
+  defp list_loop_ir_from_case(_, _), do: nil
+
+  defp list_loop_ir_from_cond(clauses) when is_list(clauses) do
+    with {break_condition, break_expr} <- cond_break_clause(clauses),
+         {list_var, _} <- empty_list_check?(break_condition),
+         continue_expr when not is_nil(continue_expr) <-
+           cond_continue_clause(clauses, break_condition),
+         {elem_var, steps} <- parse_continue_expr(list_var, continue_expr) do
+      %{list_var: list_var, elem_var: elem_var, break_expr: break_expr, steps: steps}
+    else
+      _ -> nil
+    end
+  end
+
+  defp list_loop_ir_from_cond(_), do: nil
+
+  defp case_continue_to_steps(list_var, {:cons, elem_var, rest_var, continue_expr}) do
+    steps =
+      continue_expr
+      |> block_exprs()
+      |> Enum.map(&replace_var(&1, rest_var, list_var))
+
+    {elem_var, steps}
+  end
+
+  defp case_continue_to_steps(list_var, {:wildcard, continue_expr}) do
+    parse_continue_expr(list_var, continue_expr)
+  end
+
+  defp case_continue_to_steps(_, _), do: nil
+
+  # if empty?(list), do: break(x)
+  # unless non_empty?(list), do: break(x)
+  defp empty_break_clause({:if, _, [condition, [do: {:break, _, [break_expr]}]]}) do
+    case empty_list_check?(condition) do
+      {list_var, _} -> {list_var, break_expr}
+      _ -> nil
+    end
+  end
+
+  defp empty_break_clause({:unless, _, [condition, [do: {:break, _, [break_expr]}]]}) do
+    case non_empty_list_check?(condition) do
+      {list_var, _} -> {list_var, break_expr}
+      _ -> nil
+    end
+  end
+
+  defp empty_break_clause(_), do: nil
+
+  defp cond_break_clause(clauses) do
+    Enum.find_value(clauses, fn
+      {:->, _, [[condition], {:break, _, [break_expr]}]} -> {condition, break_expr}
+      _ -> nil
+    end)
+  end
+
+  defp cond_continue_clause(clauses, break_condition) do
+    Enum.find_value(clauses, fn
+      {:->, _, [[condition], expr]} when condition != break_condition -> expr
+      _ -> nil
+    end)
+  end
+
+  defp parse_continue_expr(list_var, exprs) when is_list(exprs) do
+    case exprs do
+      [destructure | steps] ->
+        case map_destructure(destructure) do
+          {^list_var, elem_var} -> {elem_var, steps}
+          _ -> parse_continue_hd_tl(list_var, exprs)
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp parse_continue_expr(list_var, continue_expr) do
+    parse_continue_expr(list_var, block_exprs(continue_expr))
+  end
+
+  defp parse_continue_hd_tl(list_var, [_ | _] = exprs) when is_list(exprs) do
+    {middle, [advance]} = Enum.split(exprs, -1)
+
+    case next_step(advance) do
+      ^list_var ->
+        elem_var = {:elem, [], Elixir}
+        hd_expr = {:hd, [], [list_var]}
+        steps = Enum.map(middle, &replace_var(&1, hd_expr, elem_var))
+        {elem_var, steps}
+
+      _ ->
+        nil
+    end
+  end
+
+  defp parse_continue_hd_tl(_, _), do: nil
+
+  defp block_exprs({:__block__, _, exprs}), do: exprs
+  defp block_exprs(expr), do: [expr]
+
+  # Returns {condition, payload} for if/unless conditional breaks.
+  defp conditional_break({:if, _, [condition, [do: {:break, _, [payload]}]]}) do
+    {condition, payload}
+  end
+
+  defp conditional_break({:unless, _, [condition, [do: {:break, _, [payload]}]]}) do
+    {{:not, [], [condition]}, payload}
+  end
+
+  defp conditional_break(_), do: nil
+
+  defp has_any_var?(ast, vars) when is_list(vars), do: Enum.any?(vars, &has_var?(ast, &1))
+
+  defp elem_aliases(steps, elem_var) do
+    steps
+    |> Enum.reduce([elem_var], fn
+      {:=, _, [{name, _, ctx} = var, rhs]}, aliases when is_atom(name) and is_atom(ctx) ->
+        if Enum.any?(aliases, &(&1 == rhs)), do: [var | aliases], else: aliases
+
+      _, aliases ->
+        aliases
+    end)
+    |> Enum.uniq()
+  end
+
+  defp index_target_from_condition({op, _, [left, right]}, index_var) when op in [:==, :===] do
+    cond do
+      left == index_var -> right
+      right == index_var -> left
+      true -> nil
+    end
+  end
+
+  defp index_target_from_condition(
+         {{:., _, [{:__aliases__, _, [:Kernel]}, op]}, _, [left, right]},
+         index_var
+       )
+       when op in [:==, :===] do
+    index_target_from_condition({op, [], [left, right]}, index_var)
+  end
+
+  defp index_target_from_condition(_, _), do: nil
+
   # Map Pattern: loop acc: [] with [expr | acc] accumulation
   defp map_pattern([acc: []], body) do
     with {:__block__, _, [exit, destructure, accumulate]} <- body,
@@ -922,6 +1131,33 @@ defmodule Loop do
 
   defp filter_accumulate(_, _), do: nil
 
+  # None? Pattern: break(true) on empty, break(false) on first match
+  defp none_pattern([], body) do
+    with %{list_var: list_var, elem_var: elem_var, break_expr: true, steps: steps} <-
+           list_loop_ir(body),
+         aliases <- elem_aliases(steps, elem_var),
+         condition when not is_nil(condition) <-
+           Enum.find_value(steps, &none_break_condition(&1, aliases)) do
+      quote do
+        not Enum.any?(unquote(list_var), fn unquote(elem_var) -> unquote(condition) end)
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  defp none_pattern(_, _), do: nil
+
+  defp none_break_condition(step, aliases) do
+    case conditional_break(step) do
+      {condition, false} ->
+        if has_any_var?(condition, aliases), do: condition
+
+      _ ->
+        nil
+    end
+  end
+
   # Find Pattern: no accumulator, returns first matching element or nil
   defp find_pattern([], body) do
     with {:__block__, _, [exit_empty, destructure, check]} <- body,
@@ -932,11 +1168,37 @@ defmodule Loop do
         unquote(list_var) |> Enum.find(fn unquote(elem_var) -> unquote(condition) end)
       end
     else
-      _ -> nil
+      _ -> find_pattern_ir(body)
     end
   end
 
   defp find_pattern(_, _), do: nil
+
+  defp find_pattern_ir(body) do
+    with %{list_var: list_var, elem_var: elem_var, break_expr: nil, steps: steps} <-
+           list_loop_ir(body),
+         condition when not is_nil(condition) <- find_condition_from_steps(steps, elem_var) do
+      quote do
+        Enum.find(unquote(list_var), fn unquote(elem_var) -> unquote(condition) end)
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  defp find_condition_from_steps(steps, elem_var) do
+    Enum.find_value(steps, &find_condition_break(&1, elem_var))
+  end
+
+  defp find_condition_break(step, elem_var) do
+    case conditional_break(step) do
+      {condition, payload} ->
+        if same_var_ast?(payload, elem_var) and has_var?(condition, elem_var), do: condition
+
+      _ ->
+        nil
+    end
+  end
 
   defp find_exit_empty({:if, _, [condition, [do: {:break, _, [nil]}]]}) do
     case empty_list_check?(condition) do
@@ -954,6 +1216,132 @@ defmodule Loop do
 
   defp find_check(_, _), do: nil
 
+  defp find_default_pattern([], body) do
+    with %{list_var: list_var, elem_var: elem_var, break_expr: default_expr, steps: steps} <-
+           list_loop_ir(body),
+         true <- default_expr != nil,
+         true <- Macro.quoted_literal?(default_expr),
+         condition when not is_nil(condition) <- find_condition_from_steps(steps, elem_var),
+         false <- has_var_name?(condition, list_var) do
+      quote do
+        Enum.find(unquote(list_var), unquote(default_expr), fn unquote(elem_var) ->
+          unquote(condition)
+        end)
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  defp find_default_pattern(_, _), do: nil
+
+  # Find Value Pattern: break on first truthy mapped value
+  defp find_value_pattern([], body) do
+    with %{list_var: list_var, elem_var: elem_var, break_expr: nil, steps: steps} <-
+           list_loop_ir(body),
+         mapper when not is_nil(mapper) <- find_value_mapper(steps, elem_var),
+         false <- has_var_name?(mapper, list_var) do
+      quote do
+        Enum.find_value(unquote(list_var), fn unquote(elem_var) -> unquote(mapper) end)
+      end
+    else
+      _ -> find_value_pattern_hd_tl(body)
+    end
+  end
+
+  defp find_value_pattern(_, _), do: nil
+
+  defp find_value_default_pattern([], body) do
+    with %{list_var: list_var, elem_var: elem_var, break_expr: default_expr, steps: steps} <-
+           list_loop_ir(body),
+         true <- default_expr != nil,
+         true <- Macro.quoted_literal?(default_expr),
+         mapper when not is_nil(mapper) <- find_value_mapper(steps, elem_var),
+         false <- has_var_name?(mapper, list_var) do
+      quote do
+        Enum.find_value(unquote(list_var), unquote(default_expr), fn unquote(elem_var) ->
+          unquote(mapper)
+        end)
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  defp find_value_default_pattern(_, _), do: nil
+
+  defp find_value_mapper(steps, elem_var) do
+    aliases = elem_aliases(steps, elem_var)
+
+    find_assignment_mapper(steps, aliases) || find_conditional_mapper(steps, aliases)
+  end
+
+  defp find_assignment_mapper(steps, aliases) do
+    Enum.find_value(Enum.with_index(steps), fn
+      {{:=, _, [value_var, value_expr]}, idx} ->
+        if has_any_var?(value_expr, aliases) and
+             assignment_breaks_with_value?(steps, idx, value_var) do
+          value_expr
+        end
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp assignment_breaks_with_value?(steps, idx, value_var) do
+    Enum.any?(Enum.drop(steps, idx + 1), &break_matches_value?(&1, value_var))
+  end
+
+  defp break_matches_value?(step, value_var) do
+    case conditional_break(step) do
+      {condition, payload} -> condition == value_var and payload == value_var
+      _ -> false
+    end
+  end
+
+  defp find_conditional_mapper(steps, aliases) do
+    Enum.find_value(steps, &conditional_mapper_from_step(&1, aliases))
+  end
+
+  defp conditional_mapper_from_step(step, aliases) do
+    case conditional_break(step) do
+      {condition, payload} ->
+        if has_any_var?(condition, aliases) and has_any_var?(payload, aliases) and
+             payload not in aliases do
+          {:if, [], [condition, [do: payload, else: nil]]}
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp find_value_pattern_hd_tl({:__block__, _, [exit_empty, assign, check, advance]}) do
+    with list_var when not is_nil(list_var) <- find_exit_empty(exit_empty),
+         {value_var, value_expr} <- value_assignment(assign),
+         {^value_var, ^value_var} <- conditional_break(check),
+         ^list_var <- next_step(advance),
+         elem_var = {:elem, [], Elixir},
+         hd_expr = {:hd, [], [list_var]},
+         mapper = replace_var(value_expr, hd_expr, elem_var),
+         true <- has_var?(mapper, elem_var) do
+      quote do
+        Enum.find_value(unquote(list_var), fn unquote(elem_var) -> unquote(mapper) end)
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  defp find_value_pattern_hd_tl(_), do: nil
+
+  defp value_assignment({:=, _, [{name, _, ctx} = var, value_expr]})
+       when is_atom(name) and is_atom(ctx),
+       do: {var, value_expr}
+
+  defp value_assignment(_), do: nil
+
   # Count Pattern: loop count: 0 with conditional increment
   defp count_pattern([count: 0], body) do
     with {:__block__, _, [exit, destructure, accumulate]} <- body,
@@ -969,6 +1357,13 @@ defmodule Loop do
   end
 
   defp count_pattern(_, _), do: nil
+
+  defp sum_by_pattern(initials, body) do
+    Loop.Patterns.Advanced.sum_by_pattern(initials, body,
+      list_loop_ir: &list_loop_ir/1,
+      has_var: &has_var?/2
+    )
+  end
 
   defp count_exit_strategy({:if, _, [condition, [do: {:break, _, [count]}]]}) do
     case empty_list_check?(condition) do
@@ -1004,11 +1399,28 @@ defmodule Loop do
         unquote(list_var) |> Enum.any?(fn unquote(elem_var) -> unquote(condition) end)
       end
     else
-      _ -> nil
+      _ -> any_pattern_ir([result: false], body)
     end
   end
 
   defp any_pattern(_, _), do: nil
+
+  defp any_pattern_ir([{result_name, false}], body) do
+    result_var = {result_name, [], nil}
+
+    with %{list_var: list_var, elem_var: elem_var, break_expr: break_expr, steps: [accumulate]} <-
+           list_loop_ir(body),
+         true <- break_expr == result_var,
+         {^result_var, condition} <- any_accumulate(accumulate, elem_var, result_var) do
+      quote do
+        Enum.any?(unquote(list_var), fn unquote(elem_var) -> unquote(condition) end)
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  defp any_pattern_ir(_, _), do: nil
 
   defp any_exit_strategy({:if, _, [condition, [do: {:break, _, [result]}]]}) do
     case empty_list_check?(condition) do
@@ -1044,11 +1456,28 @@ defmodule Loop do
         unquote(list_var) |> Enum.all?(fn unquote(elem_var) -> unquote(condition) end)
       end
     else
-      _ -> nil
+      _ -> all_pattern_ir([result: true], body)
     end
   end
 
   defp all_pattern(_, _), do: nil
+
+  defp all_pattern_ir([{result_name, true}], body) do
+    result_var = {result_name, [], nil}
+
+    with %{list_var: list_var, elem_var: elem_var, break_expr: break_expr, steps: [accumulate]} <-
+           list_loop_ir(body),
+         true <- break_expr == result_var,
+         {^result_var, condition} <- all_accumulate(accumulate, elem_var, result_var) do
+      quote do
+        Enum.all?(unquote(list_var), fn unquote(elem_var) -> unquote(condition) end)
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  defp all_pattern_ir(_, _), do: nil
 
   defp all_exit_strategy({:if, _, [condition, [do: {:break, _, [result]}]]}) do
     case empty_list_check?(condition) do
@@ -1172,6 +1601,29 @@ defmodule Loop do
 
   defp filter_map_accumulate(_, _), do: nil
 
+  defp flat_map_pattern(initials, body) do
+    Loop.Patterns.Advanced.flat_map_pattern(initials, body,
+      list_loop_ir: &list_loop_ir/1,
+      has_var: &has_var?/2,
+      enum_reverse_arg: &enum_reverse_arg/1
+    )
+  end
+
+  defp map_reduce_pattern(initials, body) do
+    Loop.Patterns.Advanced.map_reduce_pattern(initials, body,
+      list_loop_ir: &list_loop_ir/1,
+      has_var: &has_var?/2,
+      enum_reverse_arg: &enum_reverse_arg/1
+    )
+  end
+
+  defp flat_map_reduce_pattern(initials, body) do
+    Loop.Patterns.Advanced.flat_map_reduce_pattern(initials, body,
+      list_loop_ir: &list_loop_ir/1,
+      has_var: &has_var?/2
+    )
+  end
+
   # Member? Pattern: break(false) on empty, break(true) on equality match
   defp member_pattern([], body) do
     with {:__block__, _, [exit_empty, destructure, check]} <- body,
@@ -1182,11 +1634,34 @@ defmodule Loop do
         Enum.member?(unquote(list_var), unquote(target))
       end
     else
-      _ -> nil
+      _ -> member_pattern_ir(body)
     end
   end
 
   defp member_pattern(_, _), do: nil
+
+  defp member_pattern_ir(body) do
+    with %{list_var: list_var, elem_var: elem_var, break_expr: false, steps: steps} <-
+           list_loop_ir(body),
+         target when not is_nil(target) <- member_target_from_steps(steps, elem_var) do
+      quote do
+        Enum.member?(unquote(list_var), unquote(target))
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  defp member_target_from_steps(steps, elem_var) do
+    aliases = elem_aliases(steps, elem_var)
+
+    Enum.find_value(steps, fn step ->
+      case conditional_break(step) do
+        {condition, true} -> equality_target_with_aliases(condition, aliases)
+        _ -> nil
+      end
+    end)
+  end
 
   defp member_exit_empty({:if, _, [condition, [do: {:break, _, [false]}]]}) do
     case empty_list_check?(condition) do
@@ -1207,6 +1682,24 @@ defmodule Loop do
 
   defp member_check(_, _), do: nil
 
+  defp equality_target_with_aliases({op, _, [left, right]}, aliases) when op in [:==, :===] do
+    cond do
+      left in aliases -> right
+      right in aliases -> left
+      true -> nil
+    end
+  end
+
+  defp equality_target_with_aliases(
+         {{:., _, [{:__aliases__, _, [:Kernel]}, op]}, _, [left, right]},
+         aliases
+       )
+       when op in [:==, :===] do
+    equality_target_with_aliases({op, [], [left, right]}, aliases)
+  end
+
+  defp equality_target_with_aliases(_, _), do: nil
+
   # Find Index Pattern: init index: 0, break nil on empty, conditional break with index, increment
   defp find_index_pattern(initials, body) do
     with [{index_name, 0}] <- initials,
@@ -1220,9 +1713,27 @@ defmodule Loop do
         unquote(list_var) |> Enum.find_index(fn unquote(elem_var) -> unquote(condition) end)
       end
     else
+      _ -> find_index_pattern_ir(initials, body)
+    end
+  end
+
+  defp find_index_pattern_ir([{index_name, 0}], body) do
+    index_var = {index_name, [], nil}
+
+    with %{list_var: list_var, elem_var: elem_var, break_expr: nil, steps: steps} <-
+           list_loop_ir(body),
+         condition when not is_nil(condition) <-
+           Enum.find_value(steps, fn step -> find_index_check(step, index_var, elem_var) end),
+         true <- Enum.any?(steps, &(find_index_increment(&1, index_var) == index_var)) do
+      quote do
+        Enum.find_index(unquote(list_var), fn unquote(elem_var) -> unquote(condition) end)
+      end
+    else
       _ -> nil
     end
   end
+
+  defp find_index_pattern_ir(_, _), do: nil
 
   defp find_index_check({:if, _, [condition, [do: {:break, _, [index]}]]}, index_var, elem_var) do
     if index == index_var and has_var?(condition, elem_var) do
@@ -1239,6 +1750,51 @@ defmodule Loop do
   end
 
   defp find_index_increment(_, _), do: nil
+
+  # Find At Pattern: explicit index target lookup
+  defp find_at_pattern(initials, body) do
+    with [{index_name, 0}] <- initials,
+         %{list_var: list_var, elem_var: elem_var, break_expr: nil, steps: steps} <-
+           list_loop_ir(body),
+         index_var = {index_name, [], nil},
+         target when not is_nil(target) <- find_at_target(steps, index_var, elem_var),
+         true <- Enum.any?(steps, &(find_index_increment(&1, index_var) == index_var)) do
+      find_at_quote(list_var, target)
+    else
+      _ -> nil
+    end
+  end
+
+  defp find_at_quote(list_var, target) do
+    quote do
+      n = unquote(target)
+
+      if is_integer(n) and n >= 0 do
+        Enum.at(unquote(list_var), n)
+      else
+        Enum.find_value(Enum.with_index(unquote(list_var)), fn
+          {elem, idx} when idx == n -> elem
+          _ -> nil
+        end)
+      end
+    end
+  end
+
+  defp find_at_target(steps, index_var, elem_var) do
+    aliases = elem_aliases(steps, elem_var)
+
+    Enum.find_value(steps, &find_at_target_from_step(&1, aliases, index_var))
+  end
+
+  defp find_at_target_from_step(step, aliases, index_var) do
+    case conditional_break(step) do
+      {condition, payload} ->
+        if payload in aliases, do: index_target_from_condition(condition, index_var)
+
+      _ ->
+        nil
+    end
+  end
 
   # Length Pattern: init count: 0, discard element, unconditional increment
   defp length_pattern(initials, body) do
@@ -1377,7 +1933,7 @@ defmodule Loop do
     with {:__block__, _, [exit_empty, destructure, check]} <- body,
          list_var <- drop_while_exit_empty(exit_empty),
          {^list_var, elem_var} <- map_destructure(destructure),
-         condition <- drop_while_check(check, list_var, elem_var) do
+         condition when not is_nil(condition) <- drop_while_check(check, list_var, elem_var) do
       quote do
         unquote(list_var) |> Enum.drop_while(fn unquote(elem_var) -> unquote(condition) end)
       end
@@ -1412,9 +1968,124 @@ defmodule Loop do
 
   defp drop_while_check(_, _, _), do: nil
 
+  defp partition_pattern(initials, body) do
+    Loop.Patterns.Collection.partition_pattern(initials, body,
+      empty_list_check: &empty_list_check?/1,
+      map_destructure: &map_destructure/1,
+      list_prepend: &list_prepend?/3,
+      enum_reverse_arg: &enum_reverse_arg/1
+    )
+  end
+
+  defp chunk_every_pattern(initials, body) do
+    Loop.Patterns.Advanced.chunk_every_pattern(initials, body,
+      empty_list_check: &empty_list_check?/1,
+      enum_reverse_arg: &enum_reverse_arg/1
+    )
+  end
+
+  defp chunk_by_pattern(initials, body) do
+    Loop.Patterns.Advanced.chunk_by_pattern(initials, body,
+      list_loop_ir: &list_loop_ir/1,
+      has_var: &has_var?/2,
+      enum_reverse_arg: &enum_reverse_arg/1
+    )
+  end
+
+  defp take_pattern(initials, body) do
+    Loop.Patterns.Collection.take_pattern(initials, body,
+      list_or_zero_check: &list_or_zero_check?/1,
+      map_destructure: &map_destructure/1,
+      list_prepend: &list_prepend?/3,
+      decrement_by_one: &decrement_by_one?/2,
+      enum_reverse_arg: &enum_reverse_arg/1
+    )
+  end
+
+  defp map_intersperse_pattern(initials, body) do
+    Loop.Patterns.Advanced.map_intersperse_pattern(initials, body,
+      list_loop_ir: &list_loop_ir/1,
+      has_var: &has_var?/2,
+      enum_reverse_arg: &enum_reverse_arg/1
+    )
+  end
+
+  defp map_join_pattern(initials, body) do
+    Loop.Patterns.Advanced.map_join_pattern(initials, body,
+      list_loop_ir: &list_loop_ir/1,
+      has_var: &has_var?/2
+    )
+  end
+
+  defp map_every_pattern(initials, body) do
+    Loop.Patterns.Advanced.map_every_pattern(initials, body,
+      list_loop_ir: &list_loop_ir/1,
+      has_var: &has_var?/2,
+      enum_reverse_arg: &enum_reverse_arg/1
+    )
+  end
+
+  defp take_every_pattern(initials, body) do
+    Loop.Patterns.Advanced.take_every_pattern(initials, body,
+      list_loop_ir: &list_loop_ir/1,
+      has_var: &has_var?/2,
+      enum_reverse_arg: &enum_reverse_arg/1
+    )
+  end
+
+  defp drop_pattern(initials, body) do
+    Loop.Patterns.Collection.drop_pattern(initials, body,
+      list_or_zero_check: &list_or_zero_check?/1,
+      decrement_by_one: &decrement_by_one?/2
+    )
+  end
+
+  defp split_while_pattern(initials, body) do
+    Loop.Patterns.Collection.split_while_pattern(initials, body,
+      empty_list_check: &empty_list_check?/1,
+      map_destructure: &map_destructure/1,
+      enum_reverse_arg: &enum_reverse_arg/1,
+      has_var: &has_var?/2
+    )
+  end
+
+  defp split_pattern(initials, body) do
+    Loop.Patterns.Collection.split_pattern(initials, body,
+      list_or_zero_check: &list_or_zero_check?/1,
+      map_destructure: &map_destructure/1,
+      list_prepend: &list_prepend?/3,
+      decrement_by_one: &decrement_by_one?/2,
+      enum_reverse_arg: &enum_reverse_arg/1
+    )
+  end
+
+  defp zip_with_pattern(initials, body) do
+    Loop.Patterns.Advanced.zip_with_pattern(initials, body,
+      map_destructure: &map_destructure/1,
+      has_var: &has_var?/2,
+      empty_list_check: &empty_list_check?/1,
+      enum_reverse_arg: &enum_reverse_arg/1
+    )
+  end
+
+  defp zip_reduce_pattern(initials, body) do
+    Loop.Patterns.Advanced.zip_reduce_pattern(initials, body,
+      map_destructure: &map_destructure/1,
+      has_var: &has_var?/2,
+      empty_list_check: &empty_list_check?/1
+    )
+  end
+
+  defp unzip_pattern(initials, body) do
+    Loop.Patterns.Advanced.unzip_pattern(initials, body,
+      list_loop_ir: &list_loop_ir/1,
+      enum_reverse_arg: &enum_reverse_arg/1
+    )
+  end
+
   # With Index Pattern: two initial bindings [acc: [], i: 0], accumulate {elem, i} tuples
   defp with_index_pattern(initials, body) do
-    with [{acc_name, []}, {index_name, 0}] <- initials,
+    with {acc_name, index_name, index_offset} <- with_index_initials(initials),
          {:__block__, _, [exit, destructure, accumulate, increment]} <- body,
          acc_var = {acc_name, [], nil},
          index_var = {index_name, [], nil},
@@ -1422,11 +2093,29 @@ defmodule Loop do
          {^list_var, elem_var} <- map_destructure(destructure),
          true <- with_index_accumulate(accumulate, acc_var, elem_var, index_var),
          ^index_var <- find_index_increment(increment, index_var) do
-      quote do
-        Enum.with_index(unquote(list_var))
-      end
+      with_index_quote(list_var, index_offset)
     else
       _ -> nil
+    end
+  end
+
+  defp with_index_initials([{acc_name, []}, {index_name, offset}]) when is_integer(offset),
+    do: {acc_name, index_name, offset}
+
+  defp with_index_initials([{index_name, offset}, {acc_name, []}]) when is_integer(offset),
+    do: {acc_name, index_name, offset}
+
+  defp with_index_initials(_), do: nil
+
+  defp with_index_quote(list_var, 0) do
+    quote do
+      Enum.with_index(unquote(list_var))
+    end
+  end
+
+  defp with_index_quote(list_var, offset) do
+    quote do
+      Enum.with_index(unquote(list_var), unquote(offset))
     end
   end
 
@@ -1579,6 +2268,50 @@ defmodule Loop do
 
   defp dedup_update_prev(_, _, _), do: false
 
+  defp uniq_pattern(initials, body) do
+    Loop.Patterns.Advanced.uniq_pattern(initials, body,
+      list_loop_ir: &list_loop_ir/1,
+      has_var: &has_var?/2,
+      enum_reverse_arg: &enum_reverse_arg/1
+    )
+  end
+
+  defp uniq_by_pattern(initials, body) do
+    Loop.Patterns.Advanced.uniq_by_pattern(initials, body,
+      list_loop_ir: &list_loop_ir/1,
+      has_var: &has_var?/2,
+      enum_reverse_arg: &enum_reverse_arg/1
+    )
+  end
+
+  defp min_max_by_pattern(initials, body) do
+    Loop.Patterns.Advanced.min_max_by_pattern(initials, body,
+      next_step: &next_step/1,
+      vars_equal: &vars_equal?/2,
+      empty_list_check: &empty_list_check?/1,
+      has_var: &has_var?/2,
+      replace_var: &replace_var/3
+    )
+  end
+
+  defp max_by_min_by_pattern(initials, body) do
+    Loop.Patterns.Advanced.max_by_min_by_pattern(initials, body,
+      next_step: &next_step/1,
+      vars_equal: &vars_equal?/2,
+      empty_list_check: &empty_list_check?/1,
+      has_var: &has_var?/2,
+      replace_var: &replace_var/3
+    )
+  end
+
+  defp min_max_pattern(initials, body) do
+    Loop.Patterns.Advanced.min_max_pattern(initials, body,
+      next_step: &next_step/1,
+      vars_equal: &vars_equal?/2,
+      empty_list_check: &empty_list_check?/1
+    )
+  end
+
   # Max/Min Pattern: init with hd(list), advance, exit, update with max/min
   defp max_min_pattern(initials, body) do
     with [{best_name, {:hd, _, [init_list]}}] <- initials,
@@ -1649,6 +2382,13 @@ defmodule Loop do
     end
   end
 
+  defp frequencies_by_pattern(initials, body) do
+    Loop.Patterns.Advanced.frequencies_by_pattern(initials, body,
+      list_loop_ir: &list_loop_ir/1,
+      has_var: &has_var?/2
+    )
+  end
+
   defp frequencies_exit({:if, _, [condition, [do: {:break, _, [freq]}]]}) do
     case empty_list_check?(condition) do
       {list, _} -> {list, freq}
@@ -1678,6 +2418,13 @@ defmodule Loop do
   end
 
   defp frequencies_update(_, _, _), do: false
+
+  defp group_by_pattern(initials, body) do
+    Loop.Patterns.Advanced.group_by_pattern(initials, body,
+      list_loop_ir: &list_loop_ir/1,
+      has_var: &has_var?/2
+    )
+  end
 
   # Map.new Pattern: Map.put(acc, key_fn(h), val_fn(h))
   defp map_new_pattern(initials, body) do
@@ -1725,6 +2472,47 @@ defmodule Loop do
 
   defp map_new_update(_, _, _), do: nil
 
+  # Into MapSet Pattern: set = MapSet.put(set, value)
+  defp into_mapset_pattern(initials, body) do
+    with [{set_name, _init}] <- initials,
+         %{list_var: list_var, elem_var: elem_var, break_expr: break_expr, steps: [update]} <-
+           list_loop_ir(body),
+         set_var = {set_name, [], nil},
+         true <- break_expr == set_var,
+         {^set_var, value_expr} <- into_mapset_update(update, set_var, elem_var),
+         true <- has_var?(value_expr, elem_var) do
+      into_mapset_quote(list_var, elem_var, value_expr)
+    else
+      _ -> nil
+    end
+  end
+
+  defp into_mapset_quote(list_var, elem_var, value_expr) when value_expr == elem_var do
+    quote do
+      MapSet.new(unquote(list_var))
+    end
+  end
+
+  defp into_mapset_quote(list_var, elem_var, value_expr) do
+    quote do
+      MapSet.new(unquote(list_var), fn unquote(elem_var) -> unquote(value_expr) end)
+    end
+  end
+
+  defp into_mapset_update(
+         {:=, _, [set, {{:., _, [{:__aliases__, _, [:MapSet]}, :put]}, _, [set, value_expr]}]},
+         set_var,
+         _elem_var
+       ) do
+    if set == set_var do
+      {set_var, value_expr}
+    else
+      nil
+    end
+  end
+
+  defp into_mapset_update(_, _, _), do: nil
+
   # Scan Pattern: two accumulators [acc: [], running: init], running = running op h, acc = [running | acc]
   defp scan_pattern(initials, body) do
     with [{acc_name, []}, {running_name, init}] <- initials,
@@ -1771,6 +2559,73 @@ defmodule Loop do
 
   defp scan_accumulate(_, _, _), do: false
 
+  # acc = [elem | acc]
+  defp list_prepend?({:=, _, [acc, {:|, _, [elem, acc]}]}, acc_var, elem_var) do
+    acc == acc_var and elem == elem_var
+  end
+
+  defp list_prepend?(_, _, _), do: false
+
+  # Enum.reverse(acc)
+  defp enum_reverse_arg({{:., _, [{:__aliases__, _, [:Enum]}, :reverse]}, _, [arg]}), do: arg
+
+  defp enum_reverse_arg(_), do: nil
+
+  # n = n - 1
+  defp decrement_by_one?({:=, _, [n, {:-, _, [n, 1]}]}, n_var), do: n == n_var
+
+  defp decrement_by_one?(_, _), do: false
+
+  # if list empty OR n == 0
+  defp list_or_zero_check?({op, _, [c1, c2]}) when op in [:or, :||] do
+    cond do
+      match = empty_list_check?(c1) ->
+        with {list_var, _} <- match,
+             count_var when not is_nil(count_var) <- zero_check?(c2) do
+          {list_var, count_var}
+        else
+          _ -> nil
+        end
+
+      match = empty_list_check?(c2) ->
+        with {list_var, _} <- match,
+             count_var when not is_nil(count_var) <- zero_check?(c1) do
+          {list_var, count_var}
+        else
+          _ -> nil
+        end
+
+      true ->
+        nil
+    end
+  end
+
+  defp list_or_zero_check?(_), do: nil
+
+  # n == 0 variants
+  defp zero_check?({:==, _, [n, 0]}), do: maybe_var_ast(n)
+  defp zero_check?({:==, _, [0, n]}), do: maybe_var_ast(n)
+  defp zero_check?({:===, _, [n, 0]}), do: maybe_var_ast(n)
+  defp zero_check?({:===, _, [0, n]}), do: maybe_var_ast(n)
+
+  defp zero_check?({{:., _, [{:__aliases__, _, [:Kernel]}, :==]}, _, [n, 0]}),
+    do: maybe_var_ast(n)
+
+  defp zero_check?({{:., _, [{:__aliases__, _, [:Kernel]}, :==]}, _, [0, n]}),
+    do: maybe_var_ast(n)
+
+  defp zero_check?({{:., _, [{:__aliases__, _, [:Kernel]}, :===]}, _, [n, 0]}),
+    do: maybe_var_ast(n)
+
+  defp zero_check?({{:., _, [{:__aliases__, _, [:Kernel]}, :===]}, _, [0, n]}),
+    do: maybe_var_ast(n)
+
+  defp zero_check?(_), do: nil
+
+  defp maybe_var_ast({name, _, ctx} = ast) when is_atom(name) and is_atom(ctx), do: ast
+
+  defp maybe_var_ast(_), do: nil
+
   # Helper to check if AST contains a break call
   defp has_break?(ast) do
     {_ast, found} =
@@ -1793,6 +2648,18 @@ defmodule Loop do
     found
   end
 
+  defp has_var_name?(ast, {name, _, _}) when is_atom(name) do
+    {_ast, found} =
+      Macro.prewalk(ast, false, fn
+        {^name, _, ctx} = node, _acc when ctx in [nil, Elixir] -> {node, true}
+        node, acc -> {node, acc}
+      end)
+
+    found
+  end
+
+  defp has_var_name?(_ast, _var), do: false
+
   # Helper to replace a variable/expression in AST
   defp replace_var(ast, old_var, new_var) do
     Macro.prewalk(ast, fn
@@ -1808,6 +2675,16 @@ defmodule Loop do
   end
 
   defp vars_equal?(_, _), do: false
+
+  defp same_var_ast?(left, right) do
+    case {maybe_var_ast(left), maybe_var_ast(right)} do
+      {left_var, right_var} when not is_nil(left_var) and not is_nil(right_var) ->
+        vars_equal?(left_var, right_var)
+
+      _ ->
+        left == right
+    end
+  end
 
   # Comprehensive helper to recognize various forms of "is list empty?" checks
   # Returns {list_var, list_var} if recognized, nil otherwise
