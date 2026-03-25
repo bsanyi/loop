@@ -15,7 +15,8 @@ defmodule Loop.MixProject do
       test_coverage: [
         summary: [threshold: 64],
         ignore_modules: []
-      ]
+      ],
+      test_pattern: "*_test.exs"
     ]
   end
 

@@ -1,5 +1,5 @@
 defmodule EmptyCheckTest do
-  use ExUnit.Case
+  use ExUnit.Case, async: true
   use Loop
 
   # credo:disable-for-this-file Credo.Check.Warning.ExpensiveEmptyEnumCheck
@@ -324,6 +324,18 @@ defmodule EmptyCheckTest do
   # Test with reverse pattern
   test "reverse pattern: length(list) == 0" do
     list = [1, 2, 3]
+
+    Loop.TestHelpers.assert_recognized(
+      quote do
+        loop acc: [] do
+          if length(list) == 0, do: break(acc)
+          [h | list] = list
+          acc = [h | acc]
+        end
+      end,
+      __ENV__,
+      &Loop.TestHelpers.enum_reverse_call?/1
+    )
 
     result =
       loop acc: [] do
