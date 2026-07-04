@@ -468,8 +468,9 @@ defmodule Loop.Patterns.Collection do
     end
   end
 
+  # Handle 2-element tuple break({left, []}) — raw {a, b} in quoted form
   defp split_while_append_exit_empty(
-         {:if, _, [condition, [do: {:break, _, [{:{}, _, [left_var, []]}]}]]},
+         {:if, _, [condition, [do: {:break, _, [{left_var, []}]}]]},
          left_var,
          empty_list_check
        ) do
@@ -553,8 +554,9 @@ defmodule Loop.Patterns.Collection do
 
   defp split_while_append_acc?(_, _, _), do: false
 
+  # Handle 2-element tuple break({left, [elem | list]}) — raw {a, b} in quoted form
   defp split_while_append_break_payload?(
-         {:break, _, [{:{}, _, [left_expr, [{:|, _, [elem, list]}]]}]},
+         {:break, _, [{left_expr, [{:|, _, [elem, list]}]}]},
          left_var,
          list_var,
          elem_var

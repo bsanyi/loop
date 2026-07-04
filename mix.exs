@@ -4,7 +4,7 @@ defmodule Loop.MixProject do
   def project do
     [
       app: :loop,
-      version: "0.1.2",
+      version: "0.2.1",
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       description: "Imperative style loops - functional performance",

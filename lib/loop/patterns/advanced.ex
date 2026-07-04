@@ -549,6 +549,20 @@ defmodule Loop.Patterns.Advanced do
     end
   end
 
+  # Handle 2-element tuple {left_expr, right_expr}
+  defp flat_map_reduce_prepend_roles({var1, init1}, {var2, init2}, {left_expr, right_expr}) do
+    cond do
+      concat_reverse_of?(left_expr, var1) and right_expr == var2 ->
+        {var1, var2, init2}
+
+      concat_reverse_of?(left_expr, var2) and right_expr == var1 ->
+        {var2, var1, init1}
+
+      true ->
+        nil
+    end
+  end
+
   defp flat_map_reduce_prepend_roles(_, _, _), do: nil
 
   defp flat_map_reduce_prepend_callback_tuple(
@@ -2275,7 +2289,7 @@ defmodule Loop.Patterns.Advanced do
          {^acc_var, mapped_expr} <- cons_update(accumulate),
          true <- has_var.(mapped_expr, elem1_var),
          true <- has_var.(mapped_expr, elem2_var),
-         false <- mapped_expr == {:{}, [], [elem1_var, elem2_var]} do
+         false <- mapped_expr == {elem1_var, elem2_var} do
       quote do
         Enum.zip_with(
           unquote(list1_var),
@@ -2884,12 +2898,11 @@ defmodule Loop.Patterns.Advanced do
          candidate_key_var,
          expected_compare
        ) do
-    with {compare_op, left, right} <- strict_compare(condition),
+    with compare_op when not is_nil(compare_op) <-
+           min_max_by_compare(condition, candidate_key_var, best_key_var),
          true <- compare_op == expected_compare,
          true <- best_lhs == best_var,
          true <- best_key_lhs == best_key_var,
-         true <- left == candidate_key_var,
-         true <- right == best_key_var,
          true <- do_tuple == {:{}, [], [candidate_var, candidate_key_var]},
          true <- else_tuple == {:{}, [], [best_var, best_key_var]} do
       true
@@ -2911,12 +2924,11 @@ defmodule Loop.Patterns.Advanced do
          candidate_key_var,
          expected_compare
        ) do
-    with {compare_op, left, right} <- strict_compare(condition),
+    with compare_op when not is_nil(compare_op) <-
+           min_max_by_compare(condition, candidate_key_var, best_key_var),
          true <- compare_op == expected_compare,
          true <- best_lhs == best_var,
          true <- best_key_lhs == best_key_var,
-         true <- left == candidate_key_var,
-         true <- right == best_key_var,
          true <- do_tuple == {candidate_var, candidate_key_var},
          true <- else_tuple == {best_var, best_key_var} do
       true
@@ -2926,6 +2938,22 @@ defmodule Loop.Patterns.Advanced do
   end
 
   defp min_max_by_update_tuple(_, _, _, _, _, _), do: false
+
+  # Canonicalize the strict comparison to "candidate_key op best_key" orientation.
+  # Normalize P047 rewrites `candidate_key > best_key` into `best_key < candidate_key`,
+  # so the operand-swapped form must flip the operator back.
+  defp min_max_by_compare(condition, candidate_key_var, best_key_var) do
+    case strict_compare(condition) do
+      {op, left, right} when left == candidate_key_var and right == best_key_var ->
+        op
+
+      {op, left, right} when left == best_key_var and right == candidate_key_var ->
+        if op == :<, do: :>, else: :<
+
+      _ ->
+        nil
+    end
+  end
 
   def group_by_pattern(initials, body, callbacks) do
     list_loop_ir = callback(callbacks, :list_loop_ir)
@@ -3531,7 +3559,7 @@ defmodule Loop.Patterns.Advanced do
   end
 
   defp dedup_by_acc_if(
-         {:if, _, [condition, [do: acc, else: {:|, _, [kept, acc]}]]},
+         {:if, _, [condition, [do: acc, else: [{:|, _, [kept, acc]}]]]},
          acc_var,
          prev_key_var
        )
