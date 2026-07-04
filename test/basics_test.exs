@@ -47,4 +47,53 @@ defmodule LoopBasicsTest do
 
     assert returned == nil
   end
+
+  test "user-thrown {:break, value} tuples are not swallowed by the loop" do
+    caught =
+      catch_throw(
+        loop do
+          _ = 42
+          throw({:break, :user_payload})
+        end
+      )
+
+    assert caught == {:break, :user_payload}
+  end
+
+  test "internal break bookkeeping does not clash with a user `loop_ref` variable" do
+    result =
+      loop i: 0 do
+        loop_ref = {:user, i}
+        if i == 2, do: break(loop_ref)
+        i = i + 1
+      end
+
+    Loop.TestHelpers.assert_fallback(
+      quote do
+        loop i: 0 do
+          loop_ref = {:user, i}
+          if i == 2, do: break(loop_ref)
+          i = i + 1
+        end
+      end,
+      __ENV__
+    )
+
+    assert result == {:user, 2}
+  end
+
+  test "break inside a nested loop only breaks the inner loop" do
+    result =
+      loop outer: 0 do
+        inner =
+          loop do
+            break(:inner_done)
+          end
+
+        if inner == :inner_done and outer == 2, do: break({:outer_done, outer})
+        outer = outer + 1
+      end
+
+    assert result == {:outer_done, 2}
+  end
 end

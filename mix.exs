@@ -13,7 +13,7 @@ defmodule Loop.MixProject do
       docs: docs(),
       aliases: aliases(),
       test_coverage: [
-        summary: [threshold: 64],
+        summary: [threshold: 72],
         ignore_modules: []
       ],
       test_pattern: "*_test.exs"

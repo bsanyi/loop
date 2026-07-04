@@ -14,6 +14,9 @@ inexperienced developers to write imperative-style loops that are familiar to
 them, while still allowing them to learn the underlying idiomatic functional
 constructs.
 
+If you want to play around with `loop`, I recommend checking out the
+[loop_trial](https://github.com/bsanyi/loop_trial) repo.
+
 ## Features
 
 - **Imperative Loop Syntax** - Write familiar `loop`/`break` constructs
@@ -104,7 +107,7 @@ end
 Loop recognizes many common patterns and automatically optimizes them to
 equivalent `Enum` operations at compile-time, with zero runtime overhead.
 
-The 26 classic examples are below, and there are additional advanced patterns too.
+The 26 classic patterns are below, and there are additional advanced patterns too.
 
 ### 1. Map
 

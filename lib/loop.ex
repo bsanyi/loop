@@ -16,18 +16,20 @@ defmodule Loop do
       iex> h loop
 
   This is a demo that macros are actually powerful enough to simulate something
-  alien in functional programming like a loop with seamingliy mutable state.
+  alien in functional programming like a loop with seemingly mutable state.
 
-  Yes, we can do it. But I'm not at all saying we shoud do it.
+  Yes, we can do it. But I'm not at all saying we should do it.
 
   This thing is instead a proof of concept for myself.  We can use imperative
   style loop code, and have macros that recognize certain patterns of the loop
-  and translate it inder the hood into a functional pattern, like an
+  and translate it under the hood into a functional pattern, like an
   `Enum.reduce` or even an `Enum.sum`.
 
   ## Recognized Optimization Patterns
 
-  The Loop module automatically recognizes and optimizes the following 28 patterns:
+  The Loop module automatically recognizes and optimizes the 26 classic
+  patterns below, plus dozens of additional advanced variants (see the README
+  for a showcase):
 
   ### 1. Map
       loop acc: [] do
@@ -287,7 +289,7 @@ defmodule Loop do
   ## `break()` out of the loop
 
   `loop` runs infinitely unless you escape from the loop with `break(value)`.
-  The return value if the `loop do ... end` will be `value`. If used as
+  The return value of the `loop do ... end` will be `value`. If used as
   `break()`, `nil` is returned. This just returns `123`:
 
       loop do
@@ -296,7 +298,7 @@ defmodule Loop do
 
   ## Simulation of mutable state
 
-  The bindings from the end of the `do ... end` block are carreid over to the
+  The bindings from the end of the `do ... end` block are carried over to the
   next execution of the block. The following example prints 0, 1, 2, and so on
   without ever stopping:
 
@@ -328,7 +330,7 @@ defmodule Loop do
         i = if i == 100, do: break(), else: i + 1
       end
 
-  You can use more than one initiali values, like a `step`ing value here:
+  You can use more than one initial value, like a `step`ing value here:
 
       loop i: 0, step: 2 do
         IO.puts(i)
@@ -337,9 +339,9 @@ defmodule Loop do
 
   ## `loop` just returns values, but does not change variables
 
-  This prints the numbers from 10 down to 1 and at the end return the value
-  `{:final, 1}`.  It also demonstrated that the loop cannot change the
-  surrounding environments variables. The value of `a` won't be affected:
+  This prints the numbers from 10 down to 1 and at the end returns the value
+  `{:final, 1}`.  It also demonstrates that the loop cannot change the
+  surrounding environment's variables. The value of `a` won't be affected:
 
       a = 10
 
@@ -413,6 +415,7 @@ defmodule Loop do
 
         quote bind_quoted: [body: body, initial_binding: initial_binding] do
           b = Kernel.binding()
+          ref = make_ref()
 
           loop_fun = fn loop_fun, b ->
             {_result, new_binding} = Code.eval_quoted(body, b, __ENV__)
@@ -420,9 +423,10 @@ defmodule Loop do
           end
 
           try do
-            {result, _binding} = loop_fun.(loop_fun, Keyword.merge(b, initial_binding))
+            initial = [{{:loop_ref, Loop}, ref} | Keyword.merge(b, initial_binding)]
+            {result, _binding} = loop_fun.(loop_fun, initial)
           catch
-            :throw, {:break, value} -> value
+            :throw, {:break, ^ref, value} -> value
           end
         end
 
@@ -432,11 +436,17 @@ defmodule Loop do
     end
   end
 
+  # Rewrites break/0 and break/1 into throws tagged with a loop-unique
+  # reference. The `loop_ref` variable lives in the `Loop` context, so user
+  # code inside the body can neither read nor shadow it, and a user-thrown
+  # `{:break, value}` no longer gets mistaken for a loop break.
   defp add_break(ast) do
+    loop_ref = {:loop_ref, [], Loop}
+
     ast
     |> Macro.traverse([], fn etc, acc -> {etc, acc} end, fn
-      {:break, meta, [val]}, acc -> {{:throw, meta, [{:break, val}]}, acc}
-      {:break, meta, []}, acc -> {{:throw, meta, [{:break, nil}]}, acc}
+      {:break, meta, [val]}, acc -> {{:throw, meta, [{:{}, [], [:break, loop_ref, val]}]}, acc}
+      {:break, meta, []}, acc -> {{:throw, meta, [{:{}, [], [:break, loop_ref, nil]}]}, acc}
       etc, acc -> {etc, acc}
     end)
     |> elem(0)
@@ -677,9 +687,7 @@ defmodule Loop do
             tail_var == nil or
               rhs_occurrence_count(exprs, tail_var, except: advance_idx) == 0
 
-          if not safe? do
-            exprs
-          else
+          if safe? do
             # Create merged destructure: [h | list] = list
             merged = {:=, [], [[{:|, [], [elem_var, list_var]}], list_var]}
 
@@ -690,6 +698,8 @@ defmodule Loop do
 
             # Recurse to handle multiple splits in the same block
             do_merge_split_destructures(new_exprs)
+          else
+            exprs
           end
         end
     end
